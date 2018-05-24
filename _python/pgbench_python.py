@@ -94,6 +94,11 @@ async def asyncpg_execute(conn, query, args):
     return len(await conn.fetch(query, *args))
 
 
+async def asyncpg_executemany(conn, query, args):
+    await conn.executemany(query, args)
+    return len(args)
+
+
 async def asyncpg_copy(conn, query, args):
     rows, copy = args[:2]
     result = await conn.copy_records_to_table(
@@ -146,8 +151,8 @@ def sync_worker(executor, eargs, start, duration, timeout):
     return queries, rows, latency_stats, min_latency, max_latency
 
 
-async def runner(args, connector, executor, copy_executor, is_async,
-                 arg_format, query, query_args, setup, teardown):
+async def runner(args, connector, executor, copy_executor, batch_executor,
+                 is_async, arg_format, query, query_args, setup, teardown):
 
     timeout = args.timeout * 1000
     concurrency = args.concurrency
@@ -156,6 +161,7 @@ async def runner(args, connector, executor, copy_executor, is_async,
         query = re.sub(r'\$\d+', '%s', query)
 
     is_copy = query.startswith('COPY ')
+    is_batch = query_args and isinstance(query_args[0], dict)
 
     if is_copy:
         if copy_executor is None:
@@ -172,6 +178,13 @@ async def runner(args, connector, executor, copy_executor, is_async,
             'table': match.group(1),
             'columns': [col.strip() for col in match.group(2).split(',')]
         })
+    elif is_batch:
+        if batch_executor is None:
+            raise RuntimeError('batch is not supported for {}'.format(executor))
+        executor = batch_executor
+
+        query_info = query_args[0]
+        query_args = [query_info['row']] * query_info['count']
 
     conns = []
 
@@ -346,6 +359,7 @@ if __name__ == '__main__':
         die('"setup" is present, but "teardown" is missing in query JSON')
 
     copy_executor = None
+    batch_executor = None
 
     if args.driver == 'aiopg':
         if query.startswith('COPY '):
@@ -366,8 +380,8 @@ if __name__ == '__main__':
             is_async = True
         arg_format = 'python'
     elif args.driver == 'asyncpg':
-        connector, executor, copy_executor = \
-            asyncpg_connect, asyncpg_execute, asyncpg_copy
+        connector, executor, copy_executor, batch_executor = \
+            asyncpg_connect, asyncpg_execute, asyncpg_copy, asyncpg_executemany
         is_async = True
         arg_format = 'native'
     elif args.driver == 'psycopg':
@@ -382,6 +396,7 @@ if __name__ == '__main__':
     else:
         raise ValueError('unexpected driver: {!r}'.format(args.driver))
 
-    runner_coro = runner(args, connector, executor, copy_executor, is_async,
+    runner_coro = runner(args, connector, executor, copy_executor,
+                         batch_executor, is_async,
                          arg_format, query, query_args, setup, teardown)
     loop.run_until_complete(runner_coro)
